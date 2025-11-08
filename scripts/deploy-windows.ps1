@@ -25,7 +25,7 @@ if (-not $AnkiMedia -or -not (Test-Path $AnkiMedia)) {
 }
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$projectRoot = Split-Path (Join-Path $root "..")
+$projectRoot = Split-Path -Parent $root
 $src = Join-Path $projectRoot "src"
 
 $files = @(

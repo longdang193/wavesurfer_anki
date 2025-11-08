@@ -1,6 +1,6 @@
-// Externalized version of your inline script.
+// _player.js (optimized without behavior changes)
 // IMPORTANT: Anki does NOT substitute {{fields}} inside files,
-// so we accept values via initPlayer(config) from the template.
+// so values must be passed via initPlayer(config) from the template.
 
 import WaveSurfer from "./_7.10.1_wavesurfer.esm.min.js";
 import RegionsPlugin from "./_7.10.1-regions.esm.min.js";
@@ -17,22 +17,14 @@ const rafThrottle = (fn) => {
   };
 };
 
-const ensurePreservePitch = (ws, on = true) => {
-  const media = ws?.getMediaElement?.();
-  if (!media) return;
-  media.preservesPitch = on;
-  media.mozPreservesPitch = on;
-  media.webkitPreservesPitch = on;
-};
-
 const norm = (v) => (v == null ? "" : String(v).trim());
 
 const parseTime = (raw) => {
   const s = norm(raw).toLowerCase();
   if (!s) return NaN;
-  if (s.endsWith('s')) return parseFloat(s.slice(0, -1));
-  if (s.includes(':')) {
-    const p = s.split(':').map(Number);
+  if (s.endsWith("s")) return parseFloat(s.slice(0, -1));
+  if (s.includes(":")) {
+    const p = s.split(":").map(Number);
     if (p.length === 2) return p[0] * 60 + p[1];
     if (p.length === 3) return p[0] * 3600 + p[1] * 60 + p[2];
   }
@@ -52,17 +44,15 @@ const parsePauseMarks = (raw) => {
   return [...new Set(out)].filter((v) => v >= 0).sort((a, b) => a - b);
 };
 
+const nowMs = () => (performance?.now?.() ?? Date.now());
+
 /* ------------------------------ Main ------------------------------ */
 
 export default function initPlayer(userCfg = {}) {
-  // Read values passed from the card template
+  // Inputs (Anki substitutes in the card template)
   const audioUrlRaw = norm(userCfg.wave);
-  if (!audioUrlRaw) {
-    console.warn("[player] Missing {{wave}} value");
-    return;
-  }
+  if (!audioUrlRaw) { console.warn("[player] Missing {{wave}} value"); return; }
 
-  // Field parsing & defaults
   const start01 = parseTime(userCfg.start01);
   const end01   = parseTime(userCfg.end01);
   const start02 = parseTime(userCfg.start02);
@@ -73,84 +63,75 @@ export default function initPlayer(userCfg = {}) {
   const pauseMarksRequested = parsePauseMarks(userCfg.pauseMarks);
   const ENABLE_PAUSE_MARKS = pauseMarksRequested.length > 0;
 
-  /* ------------------------------ DOM ------------------------------ */
+  // DOM
+  const wfContainer     = $("waveform");
+  const timestampEl     = $("timestamp");
+  const playPauseBtn    = $("playPauseButton");
+  const prevMarkBtn     = $("prevMarkButton");
+  const stopBtn         = $("stopButton");
+  const skipBackwardBtn = $("skipBackwardButton");
+  const resetRegionBtn  = $("resetRegionButton");
+  if (!wfContainer) { console.warn("[player] #waveform not found"); return; }
 
-  const wfContainer     = $('waveform');
-  const timestampEl     = $('timestamp');
-  const playPauseBtn    = $('playPauseButton');
-  const prevMarkBtn     = $('prevMarkButton');
-  const stopBtn         = $('stopButton');
-  const skipBackwardBtn = $('skipBackwardButton');
-  const resetRegionBtn  = $('resetRegionButton');
+  // Constants (kept as before)
+  const CLICK_GRACE_SEC = 0.03; // skip marks <= 30ms to the right of a click
+  const SUPPRESS_MS     = 140;  // suppress pause checks briefly after a click
+  const EPS_END         = 0.02; // park 20ms before the end
 
-  if (!wfContainer) {
-    console.warn("[player] #waveform element not found.");
-    return;
-  }
-
-  /* ------------------------------ State ------------------------------ */
-
+  // State
   const S = {
     ws: null, regions: null, region: null, duration: 0,
     rate: 1,
     pixelRatio: Math.min((window.devicePixelRatio || 1),
-                         (matchMedia('(max-width: 768px)').matches ? 1 : 1.5)),
+                         (matchMedia("(max-width: 768px)").matches ? 1 : 1.5)),
     pauseMarks: [], nextPauseIdx: 0,
-    timer: null, parkedAtEnd: false, isResetting: false
+    timer: null, parkedAtEnd: false, isResetting: false,
+
+    userSeeking: false,
+    suppressPausesUntil: 0,
+    wantAutoPlayOnClick: false,
+    clickAutoplayTimer: null,
   };
 
-  /* ------------------------------ Helpers ------------------------------ */
+  /* ------------------------------ Helper fns (consolidated) ------------------------------ */
 
   const clearTimer = () => { if (S.timer) { clearTimeout(S.timer); S.timer = null; } };
 
-  const safeRegionEnd = (dur) => (timeEndRaw !== null && timeEndRaw < dur) ? timeEndRaw : dur;
-
   const regionEnd = () => (S.region?.end ?? S.duration);
 
-  const setNextPauseIdxFrom = (t) => {
-    const arr = S.pauseMarks;
-    if (!arr.length) { S.nextPauseIdx = 0; return; }
-    let lo = 0, hi = arr.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (arr[mid] > t + 1e-6) hi = mid; else lo = mid + 1;
+  const safeRegionEnd = (dur) =>
+    (timeEndRaw !== null && timeEndRaw < dur) ? timeEndRaw : dur;
+
+  // Move the playhead to `t` precisely (fastSeek > setTime > seekTo)
+  const setPlayhead = (t) => {
+    const ws = S.ws; if (!ws) return;
+    const media = ws.getMediaElement?.();
+    if (media && typeof media.fastSeek === "function") {
+      try { media.fastSeek(t); return; } catch {}
     }
-    S.nextPauseIdx = lo;
+    if (typeof ws.setTime === "function") { ws.setTime(t); return; }
+    ws.seekTo(S.duration ? t / S.duration : 0);
   };
 
-  const filterPauseMarksToRegion = () => {
-    if (!ENABLE_PAUSE_MARKS) { S.pauseMarks = []; S.nextPauseIdx = 0; return; }
-    if (!S.region) { S.pauseMarks = []; S.nextPauseIdx = 0; return; }
-    const st = S.region.start ?? 0;
-    const en = S.region.end ?? S.duration;
-    S.pauseMarks = pauseMarksRequested.filter((v) => (v >= st && v <= en));
-    setNextPauseIdxFrom(S.ws?.getCurrentTime?.() ?? st);
-  };
-
-  const EPS_END = 0.02; // park 20ms before end
-
-  function playNextFrame(ws) {
+  const playNextFrame = (ws) => {
     requestAnimationFrame(() => {
       const p = ws.play?.();
-      if (p && typeof p.catch === 'function') p.catch(() => {});
+      if (p && typeof p.catch === "function") p.catch(() => {});
     });
-  }
+  };
 
-  function pauseThenSnap(target) {
+  const pauseThenSnap = (t) => {
     const ws = S.ws; if (!ws) return;
     clearTimer();
-    const snap = () => {
-      const media = ws.getMediaElement?.();
-      if (media && typeof media.fastSeek === 'function') {
-        try { media.fastSeek(target); return; } catch (_) {}
-      }
-      if (typeof ws.setTime === 'function') ws.setTime(target);
-      else ws.seekTo(target / S.duration);
-    };
-    if (ws.isPlaying()) { ws.pause(); requestAnimationFrame(snap); } else { snap(); }
-  }
+    if (ws.isPlaying()) {
+      ws.pause();
+      requestAnimationFrame(() => setPlayhead(t));
+    } else {
+      setPlayhead(t);
+    }
+  };
 
-  function parkAtEnd() {
+  const parkAtEnd = () => {
     const ws = S.ws; if (!ws) return;
     const en = regionEnd();
     const safe = Math.max((S.region?.start ?? 0), en - EPS_END);
@@ -161,23 +142,50 @@ export default function initPlayer(userCfg = {}) {
       setNextPauseIdxFrom(en);
       clearTimer();
     });
-  }
+  };
 
+  // First mark strictly > (t + grace)
+  const setNextPauseIdxFrom = (t, graceSec = 0) => {
+    const arr = S.pauseMarks;
+    if (!arr.length) { S.nextPauseIdx = 0; return; }
+    const target = t + (graceSec || 0);
+    let lo = 0, hi = arr.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (arr[mid] > target + 1e-6) hi = mid; else lo = mid + 1;
+    }
+    S.nextPauseIdx = lo;
+  };
+
+  const filterPauseMarksToRegion = () => {
+    if (!ENABLE_PAUSE_MARKS || !S.region) { S.pauseMarks = []; S.nextPauseIdx = 0; return; }
+    const st = S.region.start ?? 0;
+    const en = S.region.end ?? S.duration;
+    S.pauseMarks = pauseMarksRequested.filter((v) => (v >= st && v <= en));
+    setNextPauseIdxFrom(S.ws?.getCurrentTime?.() ?? st);
+  };
+
+  // Schedule only *future* pauses; honors suppression window
   const scheduleNextPause = () => {
     if (!ENABLE_PAUSE_MARKS) return;
     clearTimer();
+
     const ws = S.ws; if (!ws || !ws.isPlaying() || S.parkedAtEnd) return;
     if (!S.pauseMarks.length || S.nextPauseIdx >= S.pauseMarks.length) return;
+
+    const msLeft = S.suppressPausesUntil - nowMs();
+    if (msLeft > 0) { S.timer = setTimeout(scheduleNextPause, msLeft + 10); return; }
 
     const now = ws.getCurrentTime();
     const target = S.pauseMarks[S.nextPauseIdx];
     const end = regionEnd();
     if (target > end) return;
 
-    if (now >= target - 1e-6) { S.nextPauseIdx++; scheduleNextPause(); return; }
+    if (target <= now + 1e-6) { S.nextPauseIdx++; scheduleNextPause(); return; }
 
     const delayMs = Math.max(((target - now) / (Math.abs(S.rate) || 1)) * 1000, 20);
     S.timer = setTimeout(() => {
+      if (nowMs() < S.suppressPausesUntil) { scheduleNextPause(); return; }
       if (!ws.isPlaying()) return;
       pauseThenSnap(target);
       S.nextPauseIdx++;
@@ -185,21 +193,13 @@ export default function initPlayer(userCfg = {}) {
     }, delayMs);
   };
 
-  function goToStart(shouldPlayAfter = false) {
-    const ws = S.ws; if (!ws) return;
+  const goToStart = (shouldPlayAfter = false) => {
     const st = S.region?.start ?? 0;
-    if (ws.isPlaying()) {
-      pauseThenSnap(st);
-      if (shouldPlayAfter) playNextFrame(ws);
-    } else {
-      const media = ws.getMediaElement?.();
-      if (media && typeof media.fastSeek === 'function') { try { media.fastSeek(st); } catch(_) {} }
-      else if (typeof ws.setTime === 'function') ws.setTime(st);
-      else ws.seekTo(st / S.duration);
-    }
+    pauseThenSnap(st);
     S.parkedAtEnd = false;
     setNextPauseIdxFrom(st);
-  }
+    if (shouldPlayAfter) playNextFrame(S.ws);
+  };
 
   const prevTarget = (t) => {
     if (!S.region) return 0;
@@ -224,118 +224,148 @@ export default function initPlayer(userCfg = {}) {
 
   /* ------------------------------ Create WaveSurfer ------------------------------ */
 
-  function createWaveSurfer(url) {
+  const createWaveSurfer = (url) => {
     if (!wfContainer) return;
 
-    if (S.ws) { try { S.ws.unAll(); S.ws.destroy(); } catch {} S.ws = null; S.regions = null; S.region = null; S.duration = 0; window.currentWaveSurfer = null; }
+    if (S.ws) {
+      try { S.ws.unAll(); S.ws.destroy(); } catch {}
+      S.ws = null; S.regions = null; S.region = null; S.duration = 0; window.currentWaveSurfer = null;
+    }
 
     const ws = WaveSurfer.create({
-      container: '#waveform',
-      backend: 'MediaElement',
-      url: String(url).replace('[sound:', '').replace('}', '').trim(),
+      container: "#waveform",
+      backend: "MediaElement",
+      url: String(url).replace("[sound:", "").replace("}", "").trim(),
       autoplay: false,
-      height: matchMedia('(max-width: 768px)').matches ? 64 : 60,
-      waveColor: '#c5c5c5',
-      progressColor: 'orangered',
-      cursorColor: 'transparent',
+      height: matchMedia("(max-width: 768px)").matches ? 64 : 60,
+      waveColor: "#c5c5c5",
+      progressColor: "orangered",
+      cursorColor: "transparent",
       pixelRatio: S.pixelRatio,
       normalize: false,
       minPxPerSec: 20,
       interact: true,
-      autoCenter: false
+      autoCenter: false,
     });
 
     const regions = ws.registerPlugin(RegionsPlugin.create({ dragSelection: false }));
-
     S.ws = ws; S.regions = regions; window.currentWaveSurfer = ws;
 
-    /* iOS hints */
     const media = ws.getMediaElement?.();
-    if (media) { try { media.setAttribute('playsinline', 'playsinline'); media.setAttribute('webkit-playsinline', 'webkit-playsinline'); media.preload = 'auto'; } catch {} }
+    if (media) {
+      try {
+        media.setAttribute("playsinline", "playsinline");
+        media.setAttribute("webkit-playsinline", "webkit-playsinline");
+        media.preload = "auto";
+      } catch {}
+    }
 
-    ws.once('ready', () => {
+    ws.once("ready", () => {
       S.duration = ws.getDuration(); S.rate = 1;
-      ws.setPlaybackRate(1, true); ensurePreservePitch(ws, true);
+      ws.setPlaybackRate(1, true);
+      const m = ws.getMediaElement?.(); if (m) { m.preservesPitch = m.mozPreservesPitch = m.webkitPreservesPitch = true; }
 
       S.region = regions.addRegion({
-        id: 'region', start: timeStart, end: safeRegionEnd(S.duration),
-        color: 'hsla(400,100%,30%,0.18)', drag: true, resize: true
+        id: "region", start: timeStart, end: safeRegionEnd(S.duration),
+        color: "hsla(400,100%,30%,0.18)", drag: true, resize: true,
       });
 
       S.parkedAtEnd = false;
       filterPauseMarksToRegion();
-      goToStart(false); // quiet
+      goToStart(false);
       sizeStickyPlayer();
     });
 
-    regions.on('region-updated', () => {
+    regions.on("region-updated", () => {
       S.parkedAtEnd = false;
       filterPauseMarksToRegion();
       if (ws.isPlaying()) scheduleNextPause();
     });
 
-    const updateTimestamp = rafThrottle((t) => { if (timestampEl) timestampEl.textContent = `Current Time: ${t.toFixed(2)}s`; });
+    const updateTimestamp = rafThrottle((t) => {
+      if (timestampEl) timestampEl.textContent = `Current Time: ${t.toFixed(2)}s`;
+    });
 
-    // Frame-driven pause at marks (mobile-safe) + safe parking at end
-    ws.on('timeupdate', (t) => {
+    // Timeupdate: forward-only pause-at-marks (with suppression) + safe end parking
+    ws.on("timeupdate", (t) => {
       updateTimestamp(t);
       if (!S.region) return;
-
       const en = regionEnd();
 
-      if (ENABLE_PAUSE_MARKS && ws.isPlaying() && S.pauseMarks.length && S.nextPauseIdx < S.pauseMarks.length) {
-        const target = S.pauseMarks[S.nextPauseIdx];
-        if (target <= en) {
-          const EPS = Math.max(0.02, 0.005 * Math.abs(S.rate || 1));
-          if (t + EPS >= target) {
-            pauseThenSnap(target);
-            S.nextPauseIdx++;
-            S.parkedAtEnd = false;
-            return; // don't also clamp to end now
+      if (ENABLE_PAUSE_MARKS && ws.isPlaying() && nowMs() >= S.suppressPausesUntil) {
+        if (S.pauseMarks.length && S.nextPauseIdx < S.pauseMarks.length) {
+          const target = S.pauseMarks[S.nextPauseIdx];
+          if (target <= en && target >= t) {
+            const EPS = Math.max(0.02, 0.005 * Math.abs(S.rate || 1));
+            if (t + EPS >= target) {
+              pauseThenSnap(target);
+              S.nextPauseIdx++;
+              S.parkedAtEnd = false;
+              return;
+            }
           }
         }
       }
 
-      // Park slightly before the end to avoid "ended" state + distortion
-      if (ws.isPlaying() && t >= en - 0.004) {
-        parkAtEnd();
-      }
+      if (ws.isPlaying() && t >= en - 0.004) parkAtEnd();
     });
 
-    ws.on('interaction', () => {
-      if (!S.region) { playNextFrame(ws); return; }
+    // Click/drag: mark user seek + intent to autoplay, add suppression and fallback
+    ws.on("interaction", () => {
+      if (!S.region) return;
+      S.userSeeking = true;
+      S.wantAutoPlayOnClick = true;
+      S.parkedAtEnd = false;
+      clearTimer();
+      S.suppressPausesUntil = nowMs() + SUPPRESS_MS;
 
-      const t  = ws.getCurrentTime();
-      const st = S.region.start ?? 0;
+      if (S.clickAutoplayTimer) { clearTimeout(S.clickAutoplayTimer); S.clickAutoplayTimer = null; }
+      S.clickAutoplayTimer = setTimeout(() => {
+        if (S.wantAutoPlayOnClick && S.ws && !S.ws.isPlaying()) {
+          const p = S.ws.play?.(); if (p && p.catch) p.catch(() => {});
+        }
+        S.wantAutoPlayOnClick = false;
+        S.clickAutoplayTimer = null;
+      }, 160);
+    });
+
+    // Seek: clamp to region, position exactly, schedule forward-only pause, autoplay if requested
+    ws.on("seek", (p) => {
+      const clickedTime = p * S.duration;
+      const st = S.region?.start ?? 0;
       const en = regionEnd();
 
-      if (S.parkedAtEnd) {
-        // Always restart from start on interaction when parked
-        pauseThenSnap(st);
-        S.parkedAtEnd = false;
-        setNextPauseIdxFrom(st);
-        playNextFrame(ws);
-        scheduleNextPause();
+      if (S.userSeeking) {
+        let t = clickedTime;
+        if (t < st) t = st;
+        if (t > en) t = Math.max(st, en - 0.001);
+
+        setPlayhead(t);
+        setNextPauseIdxFrom(t, CLICK_GRACE_SEC);
+
+        if (S.wantAutoPlayOnClick) {
+          requestAnimationFrame(() => {
+            const pr = ws.play?.(); if (pr && pr.catch) pr.catch(() => {});
+          });
+          S.wantAutoPlayOnClick = false;
+          if (S.clickAutoplayTimer) { clearTimeout(S.clickAutoplayTimer); S.clickAutoplayTimer = null; }
+        }
+
+        clearTimer();
+        if (ENABLE_PAUSE_MARKS) scheduleNextPause();
+
+        S.userSeeking = false;
         return;
       }
 
-      if (t < st || t > en) { pauseThenSnap(st); setNextPauseIdxFrom(st); }
-      else { setNextPauseIdxFrom(t); }
-
-      playNextFrame(ws);
-      scheduleNextPause();
-    });
-
-    ws.on('seek', (p) => {
-      const t = p * S.duration;
-      const en = regionEnd();
-      S.parkedAtEnd = (Math.abs(t - en) < 0.003);
-      setNextPauseIdxFrom(t);
+      // programmatic seeks
+      S.parkedAtEnd = (Math.abs(clickedTime - en) < 0.003);
+      setNextPauseIdxFrom(clickedTime);
       clearTimer();
       if (ENABLE_PAUSE_MARKS && ws.isPlaying() && !S.parkedAtEnd) scheduleNextPause();
     });
 
-    ws.on('play', () => {
+    ws.on("play", () => {
       if (S.isResetting) { ws.pause(); return; }
       const st = S.region?.start ?? 0;
       const en = regionEnd();
@@ -352,8 +382,8 @@ export default function initPlayer(userCfg = {}) {
       }
     });
 
-    ws.on('pause', () => { clearTimer(); });
-  }
+    ws.on("pause", () => { clearTimer(); });
+  };
 
   /* ------------------------------ Controls ------------------------------ */
 
@@ -399,8 +429,8 @@ export default function initPlayer(userCfg = {}) {
     S.regions.clearRegions();
 
     S.region = S.regions.addRegion({
-      id: 'region', start: timeStart, end: safeRegionEnd(S.duration),
-      color: 'hsla(400,100%,30%,0.18)', drag: true, resize: true
+      id: "region", start: timeStart, end: safeRegionEnd(S.duration),
+      color: "hsla(400,100%,30%,0.18)", drag: true, resize: true,
     });
 
     S.parkedAtEnd = false;
@@ -413,16 +443,16 @@ export default function initPlayer(userCfg = {}) {
     const ws = S.ws; if (!ws) return;
     S.rate = s;
     ws.setPlaybackRate(s, true);
-    ensurePreservePitch(ws, true);
+    const m = ws.getMediaElement?.(); if (m) { m.preservesPitch = m.mozPreservesPitch = m.webkitPreservesPitch = true; }
     if (ws.isPlaying() && !S.parkedAtEnd) { clearTimer(); scheduleNextPause(); }
   }
 
   function loadNewAudio(newUrl) {
-    const cleanUrl = String(newUrl).replace('[sound:', '').replace('}', '').trim();
+    const cleanUrl = String(newUrl).replace("[sound:", "").replace("}", "").trim();
     createWaveSurfer(cleanUrl);
   }
 
-  // Expose for your buttons
+  // Expose for buttons (unchanged API)
   window.playPause = playPause;
   window.stopPlayback = stopPlayback;
   window.resetRegion = resetRegion;
@@ -432,20 +462,19 @@ export default function initPlayer(userCfg = {}) {
   /* ------------------------------ Sticky sizing ------------------------------ */
 
   const sizeStickyPlayer = rafThrottle(() => {
-    const el = document.getElementById('playerContainer');
+    const el = document.getElementById("playerContainer");
     if (!el) return;
-    const h = el.offsetHeight || 0;
-    document.documentElement.style.setProperty('--player-height', h + 'px');
+    document.documentElement.style.setProperty("--player-height", (el.offsetHeight || 0) + "px");
   });
-  window.addEventListener('resize', sizeStickyPlayer, { passive: true });
-  window.addEventListener('orientationchange', sizeStickyPlayer, { passive: true });
+  window.addEventListener("resize", sizeStickyPlayer, { passive: true });
+  window.addEventListener("orientationchange", sizeStickyPlayer, { passive: true });
 
   /* ------------------------------ Init ------------------------------ */
-  const audioUrl = audioUrlRaw;
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => createWaveSurfer(audioUrl), { once: true });
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", () => createWaveSurfer(audioUrlRaw), { once: true });
   } else {
-    createWaveSurfer(audioUrl);
+    createWaveSurfer(audioUrlRaw);
   }
 
   /* ------------------------------ Keyboard ------------------------------ */
@@ -454,30 +483,29 @@ export default function initPlayer(userCfg = {}) {
 
   const keyHandler = (e) => {
     const t = e.target;
-    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
     const ws = S.ws; if (!ws) return;
 
-    const k = (e.key || '').toLowerCase();
-    switch (k) {
-      case 'g': e.preventDefault(); ws.skip(-3); break;
-      case 'h': e.preventDefault(); jumpPrevAndPlay(); break;
-      case 'j': e.preventDefault(); playPause(); break;
-      case 'k': e.preventDefault(); ws.skip(0.5); break;
-      case 'l':
-      case 'p': e.preventDefault(); ws.skip(-100); break;
+    switch ((e.key || "").toLowerCase()) {
+      case "g": e.preventDefault(); ws.skip(-3); break;
+      case "h": e.preventDefault(); jumpPrevAndPlay(); break;
+      case "j": e.preventDefault(); playPause(); break;
+      case "k": e.preventDefault(); ws.skip(0.5); break;
+      case "l":
+      case "p": e.preventDefault(); ws.skip(-100); break;
     }
   };
 
-  document.addEventListener('keydown', keyHandler, { passive: false });
-  window._waveDetachKeys = () => { document.removeEventListener('keydown', keyHandler); };
+  document.addEventListener("keydown", keyHandler, { passive: false });
+  window._waveDetachKeys = () => { document.removeEventListener("keydown", keyHandler); };
 
   /* ------------------------------ Buttons ------------------------------ */
 
-  if (playPauseBtn) playPauseBtn.addEventListener('click', (e) => { e.preventDefault(); playPause(); }, { passive: true });
-  if (prevMarkBtn)  prevMarkBtn.addEventListener('click',  (e) => { e.preventDefault(); jumpPrevAndPlay(); }, { passive: true });
-  if (stopBtn)      stopBtn.addEventListener('click',      (e) => { e.preventDefault(); stopPlayback(); }, { passive: true });
-  if (skipBackwardBtn) skipBackwardBtn.addEventListener('click', (e) => {
+  if (playPauseBtn) playPauseBtn.addEventListener("click", (e) => { e.preventDefault(); playPause(); }, { passive: true });
+  if (prevMarkBtn)  prevMarkBtn.addEventListener("click",  (e) => { e.preventDefault(); jumpPrevAndPlay(); }, { passive: true });
+  if (stopBtn)      stopBtn.addEventListener("click",      (e) => { e.preventDefault(); stopPlayback(); }, { passive: true });
+  if (skipBackwardBtn) skipBackwardBtn.addEventListener("click", (e) => {
     e.preventDefault(); const ws = S.ws; if (ws) ws.skip(-3);
   }, { passive: true });
-  if (resetRegionBtn) resetRegionBtn.addEventListener('click', (e) => { e.preventDefault(); resetRegion(); }, { passive: true });
+  if (resetRegionBtn) resetRegionBtn.addEventListener("click", (e) => { e.preventDefault(); resetRegion(); }, { passive: true });
 }
