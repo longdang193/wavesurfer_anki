@@ -1,6 +1,6 @@
-// _player.js (optimized without behavior changes)
-// IMPORTANT: Anki does NOT substitute {{fields}} inside files,
-// so values must be passed via initPlayer(config) from the template.
+// _player.js (optimized; same behavior & public API)
+// Fixes kept: robust URL cleaning, mobile gesture-safe playback, precise seeking,
+// safe skipping, and boundary-cross fix for -3s/backward jumps.
 
 import WaveSurfer from "./_7.10.1_wavesurfer.esm.min.js";
 import RegionsPlugin from "./_7.10.1-regions.esm.min.js";
@@ -46,12 +46,33 @@ const parsePauseMarks = (raw) => {
 
 const nowMs = () => (performance?.now?.() ?? Date.now());
 
+/* ------------------------------ Environment ------------------------------ */
+
+const isAndroid = /Android/i.test(navigator.userAgent);
+const isMobile  = matchMedia("(pointer:coarse)").matches;
+const isNarrow  = matchMedia("(max-width: 768px)").matches;
+
+/* ------------------------------ URL cleaning ------------------------------ */
+
+const cleanAudioUrl = (raw) =>
+  norm(raw)
+    .replace(/^\[sound:/i, "")
+    .replace(/\]$/, "")
+    .replace(/^['"]|['"]$/g, "")
+    .trim();
+
+const isLikelyAudio = (url) => /\.(mp3|m4a|aac|wav|ogg|oga|flac|webm)$/i.test(url);
+
 /* ------------------------------ Main ------------------------------ */
 
 export default function initPlayer(userCfg = {}) {
   // Inputs (Anki substitutes in the card template)
   const audioUrlRaw = norm(userCfg.wave);
   if (!audioUrlRaw) { console.warn("[player] Missing {{wave}} value"); return; }
+
+  const audioUrl = cleanAudioUrl(audioUrlRaw);
+  if (!audioUrl)  { console.error("[player] Cleaned audio URL is empty. Raw:", audioUrlRaw); return; }
+  if (!isLikelyAudio(audioUrl)) { console.warn("[player] URL may not be audio:", audioUrl); }
 
   const start01 = parseTime(userCfg.start01);
   const end01   = parseTime(userCfg.end01);
@@ -73,27 +94,29 @@ export default function initPlayer(userCfg = {}) {
   const resetRegionBtn  = $("resetRegionButton");
   if (!wfContainer) { console.warn("[player] #waveform not found"); return; }
 
-  // Constants (kept as before)
-  const CLICK_GRACE_SEC = 0.03; // skip marks <= 30ms to the right of a click
-  const SUPPRESS_MS     = 140;  // suppress pause checks briefly after a click
-  const EPS_END         = 0.02; // park 20ms before the end
+  // Tunables
+  const CLICK_GRACE_SEC     = 0.03;   // forward grace after user taps
+  const DESKTOP_SUPPRESS_MS = 140;    // pause-scheduler suppression after tap
+  const MOBILE_SUPPRESS_MS  = 220;
+  const EPS_END             = 0.02;   // park 20ms before region end
+  const MOBILE_EPS          = 0.06;   // timeupdate tolerance on mobile
+  const NUDGE_BEFORE        = 0.006;  // land just before a boundary
+  const CATCH_EPS           = 0.025;  // consider "at boundary" within 25ms
 
   // State
   const S = {
     ws: null, regions: null, region: null, duration: 0,
     rate: 1,
-    pixelRatio: Math.min((window.devicePixelRatio || 1),
-                         (matchMedia("(max-width: 768px)").matches ? 1 : 1.5)),
+    pixelRatio: Math.min((window.devicePixelRatio || 1), (isNarrow ? 1 : 1.5)),
     pauseMarks: [], nextPauseIdx: 0,
     timer: null, parkedAtEnd: false, isResetting: false,
 
     userSeeking: false,
     suppressPausesUntil: 0,
     wantAutoPlayOnClick: false,
-    clickAutoplayTimer: null,
   };
 
-  /* ------------------------------ Helper fns (consolidated) ------------------------------ */
+  /* ------------------------------ Small helpers ------------------------------ */
 
   const clearTimer = () => { if (S.timer) { clearTimeout(S.timer); S.timer = null; } };
 
@@ -102,22 +125,24 @@ export default function initPlayer(userCfg = {}) {
   const safeRegionEnd = (dur) =>
     (timeEndRaw !== null && timeEndRaw < dur) ? timeEndRaw : dur;
 
-  // Move the playhead to `t` precisely (fastSeek > setTime > seekTo)
+  const playSafe = (ws) => {
+    const p = ws.play?.();
+    if (p && p.catch) p.catch(() => {});
+  };
+
+  // Prefer direct currentTime on mobile; fall back to WS APIs
   const setPlayhead = (t) => {
     const ws = S.ws; if (!ws) return;
     const media = ws.getMediaElement?.();
+
+    if (media && isMobile) {
+      try { media.currentTime = t; return; } catch {}
+    }
     if (media && typeof media.fastSeek === "function") {
       try { media.fastSeek(t); return; } catch {}
     }
     if (typeof ws.setTime === "function") { ws.setTime(t); return; }
     ws.seekTo(S.duration ? t / S.duration : 0);
-  };
-
-  const playNextFrame = (ws) => {
-    requestAnimationFrame(() => {
-      const p = ws.play?.();
-      if (p && typeof p.catch === "function") p.catch(() => {});
-    });
   };
 
   const pauseThenSnap = (t) => {
@@ -139,22 +164,36 @@ export default function initPlayer(userCfg = {}) {
     requestAnimationFrame(() => {
       pauseThenSnap(safe);
       S.parkedAtEnd = true;
-      setNextPauseIdxFrom(en);
+      setNextPauseIdxFrom(en, true); // strictly GT from end
       clearTimer();
     });
   };
 
-  // First mark strictly > (t + grace)
-  const setNextPauseIdxFrom = (t, graceSec = 0) => {
-    const arr = S.pauseMarks;
-    if (!arr.length) { S.nextPauseIdx = 0; return; }
-    const target = t + (graceSec || 0);
-    let lo = 0, hi = arr.length;
+  /* -------- Binary searches for marks (shared + compact) -------- */
+  // mode: 'gt' -> first > t, 'gte' -> first >= t
+  const firstMark = (arr, t, mode) => {
+    let lo = 0, hi = arr.length, eps = 1e-9;
+    const cmp = mode === "gt"
+      ? (x, y) => x > y + eps
+      : (x, y) => x >= y - eps;
     while (lo < hi) {
       const mid = (lo + hi) >> 1;
-      if (arr[mid] > target + 1e-6) hi = mid; else lo = mid + 1;
+      if (cmp(arr[mid], t)) hi = mid; else lo = mid + 1;
     }
-    S.nextPauseIdx = lo;
+    return lo;
+  };
+
+  // Next mark strictly > (t + grace) OR inclusive >= t
+  const setNextPauseIdxFrom = (t, strictlyGT = false, graceSec = 0) => {
+    const arr = S.pauseMarks;
+    if (!arr.length) { S.nextPauseIdx = 0; return; }
+    const target = strictlyGT ? t : (t + (graceSec || 0));
+    S.nextPauseIdx = firstMark(arr, target, strictlyGT ? "gt" : "gt");
+  };
+  const setNextPauseIdxFromInclusive = (t) => {
+    const arr = S.pauseMarks;
+    if (!arr.length) { S.nextPauseIdx = 0; return; }
+    S.nextPauseIdx = firstMark(arr, t, "gte");
   };
 
   const filterPauseMarksToRegion = () => {
@@ -162,7 +201,7 @@ export default function initPlayer(userCfg = {}) {
     const st = S.region.start ?? 0;
     const en = S.region.end ?? S.duration;
     S.pauseMarks = pauseMarksRequested.filter((v) => (v >= st && v <= en));
-    setNextPauseIdxFrom(S.ws?.getCurrentTime?.() ?? st);
+    setNextPauseIdxFrom(S.ws?.getCurrentTime?.() ?? st, true);
   };
 
   // Schedule only *future* pauses; honors suppression window
@@ -185,9 +224,9 @@ export default function initPlayer(userCfg = {}) {
 
     const delayMs = Math.max(((target - now) / (Math.abs(S.rate) || 1)) * 1000, 20);
     S.timer = setTimeout(() => {
-      if (nowMs() < S.suppressPausesUntil) { scheduleNextPause(); return; }
-      if (!ws.isPlaying()) return;
-      pauseThenSnap(target);
+      if (nowMs() < S.suppressPausesUntil || !ws.isPlaying()) { scheduleNextPause(); return; }
+      const nudge = isMobile ? NUDGE_BEFORE : 0;
+      pauseThenSnap(Math.max(0, target - nudge));
       S.nextPauseIdx++;
       clearTimer();
     }, delayMs);
@@ -197,8 +236,8 @@ export default function initPlayer(userCfg = {}) {
     const st = S.region?.start ?? 0;
     pauseThenSnap(st);
     S.parkedAtEnd = false;
-    setNextPauseIdxFrom(st);
-    if (shouldPlayAfter) playNextFrame(S.ws);
+    setNextPauseIdxFrom(st, true);
+    if (shouldPlayAfter) requestAnimationFrame(() => playSafe(S.ws));
   };
 
   const prevTarget = (t) => {
@@ -215,12 +254,63 @@ export default function initPlayer(userCfg = {}) {
     const ws = S.ws; if (!ws) return;
     const base = S.parkedAtEnd ? regionEnd() : ws.getCurrentTime();
     const target = prevTarget(base);
-    pauseThenSnap(target);
-    S.parkedAtEnd = false;
-    setNextPauseIdxFrom(target);
-    playNextFrame(ws);
-    scheduleNextPause();
+    if (ws.isPlaying()) {
+      setPlayhead(target);
+      S.parkedAtEnd = false;
+      setNextPauseIdxFromInclusive(target);
+      clearTimer();
+      scheduleNextPause();
+    } else {
+      pauseThenSnap(target);
+      S.parkedAtEnd = false;
+      setNextPauseIdxFromInclusive(target);
+      requestAnimationFrame(() => playSafe(ws));
+      scheduleNextPause();
+    }
   };
+
+  // Safe programmatic skip that keeps pause scheduling in sync + boundary-cross fix
+  const skipBy = (deltaSec) => {
+    const ws = S.ws; if (!ws) return;
+    const st = S.region?.start ?? 0;
+    const en = regionEnd();
+    const cur = ws.getCurrentTime();
+
+    let t = cur + deltaSec;
+
+    // clamp to region
+    if (t < st) t = st;
+    if (t > en) t = Math.max(st, en - 0.001);
+
+    // boundary handling when jumping BACKWARD across segments
+    const arr = S.pauseMarks;
+    if (arr.length && deltaSec < 0) {
+      const i = firstMark(arr, t, "gte");
+      if (i < arr.length) {
+        const boundary = arr[i];
+        if (t >= boundary - CATCH_EPS) t = Math.min(boundary - NUDGE_BEFORE, Math.max(st, t));
+        if (t >= boundary) t = Math.max(st, boundary - NUDGE_BEFORE);
+      }
+    }
+
+    // Apply the seek
+    if (ws.isPlaying()) {
+      setPlayhead(t);
+      S.parkedAtEnd = false;
+      deltaSec < 0 ? setNextPauseIdxFromInclusive(t)
+                   : setNextPauseIdxFrom(t, true, CLICK_GRACE_SEC);
+      clearTimer();
+      if (ENABLE_PAUSE_MARKS) scheduleNextPause();
+    } else {
+      pauseThenSnap(t);
+      S.parkedAtEnd = false;
+      deltaSec < 0 ? setNextPauseIdxFromInclusive(t)
+                   : setNextPauseIdxFrom(t, true, CLICK_GRACE_SEC);
+      clearTimer();
+    }
+  };
+
+  const jumpBack3s = () => skipBy(-3);
 
   /* ------------------------------ Create WaveSurfer ------------------------------ */
 
@@ -235,9 +325,9 @@ export default function initPlayer(userCfg = {}) {
     const ws = WaveSurfer.create({
       container: "#waveform",
       backend: "MediaElement",
-      url: String(url).replace("[sound:", "").replace("}", "").trim(),
+      url, // already cleaned
       autoplay: false,
-      height: matchMedia("(max-width: 768px)").matches ? 64 : 60,
+      height: isNarrow ? 64 : 60,
       waveColor: "#c5c5c5",
       progressColor: "orangered",
       cursorColor: "transparent",
@@ -248,22 +338,27 @@ export default function initPlayer(userCfg = {}) {
       autoCenter: false,
     });
 
+    ws.on("error", (e) => { console.error("[player] WaveSurfer error:", e); });
+
     const regions = ws.registerPlugin(RegionsPlugin.create({ dragSelection: false }));
     S.ws = ws; S.regions = regions; window.currentWaveSurfer = ws;
 
     const media = ws.getMediaElement?.();
     if (media) {
-      try {
-        media.setAttribute("playsinline", "playsinline");
-        media.setAttribute("webkit-playsinline", "webkit-playsinline");
-        media.preload = "auto";
-      } catch {}
+      media.setAttribute?.("playsinline", "playsinline");
+      media.setAttribute?.("webkit-playsinline", "webkit-playsinline");
+      try { media.preload = "auto"; } catch {}
+      media.addEventListener?.("error", () => {
+        const err = media.error;
+        console.error("[player] MediaElement error", err?.code, err);
+      });
     }
 
     ws.once("ready", () => {
       S.duration = ws.getDuration(); S.rate = 1;
       ws.setPlaybackRate(1, true);
-      const m = ws.getMediaElement?.(); if (m) { m.preservesPitch = m.mozPreservesPitch = m.webkitPreservesPitch = true; }
+      const m = ws.getMediaElement?.();
+      if (m) { m.preservesPitch = m.mozPreservesPitch = m.webkitPreservesPitch = true; }
 
       S.region = regions.addRegion({
         id: "region", start: timeStart, end: safeRegionEnd(S.duration),
@@ -286,7 +381,7 @@ export default function initPlayer(userCfg = {}) {
       if (timestampEl) timestampEl.textContent = `Current Time: ${t.toFixed(2)}s`;
     });
 
-    // Timeupdate: forward-only pause-at-marks (with suppression) + safe end parking
+    // Timeupdate: pause-at-marks with suppression + safe end parking
     ws.on("timeupdate", (t) => {
       updateTimestamp(t);
       if (!S.region) return;
@@ -296,9 +391,10 @@ export default function initPlayer(userCfg = {}) {
         if (S.pauseMarks.length && S.nextPauseIdx < S.pauseMarks.length) {
           const target = S.pauseMarks[S.nextPauseIdx];
           if (target <= en && target >= t) {
-            const EPS = Math.max(0.02, 0.005 * Math.abs(S.rate || 1));
+            const EPS = isMobile ? MOBILE_EPS : Math.max(0.02, 0.005 * Math.abs(S.rate || 1));
             if (t + EPS >= target) {
-              pauseThenSnap(target);
+              const nudge = isMobile ? NUDGE_BEFORE : 0;
+              pauseThenSnap(Math.max(0, target - nudge));
               S.nextPauseIdx++;
               S.parkedAtEnd = false;
               return;
@@ -310,26 +406,20 @@ export default function initPlayer(userCfg = {}) {
       if (ws.isPlaying() && t >= en - 0.004) parkAtEnd();
     });
 
-    // Click/drag: mark user seek + intent to autoplay, add suppression and fallback
+    // Interaction: mark user seek + intent to autoplay, add suppression and mobile-safe play()
     ws.on("interaction", () => {
       if (!S.region) return;
       S.userSeeking = true;
       S.wantAutoPlayOnClick = true;
       S.parkedAtEnd = false;
       clearTimer();
-      S.suppressPausesUntil = nowMs() + SUPPRESS_MS;
+      S.suppressPausesUntil = nowMs() + (isMobile ? MOBILE_SUPPRESS_MS : DESKTOP_SUPPRESS_MS);
 
-      if (S.clickAutoplayTimer) { clearTimeout(S.clickAutoplayTimer); S.clickAutoplayTimer = null; }
-      S.clickAutoplayTimer = setTimeout(() => {
-        if (S.wantAutoPlayOnClick && S.ws && !S.ws.isPlaying()) {
-          const p = S.ws.play?.(); if (p && p.catch) p.catch(() => {});
-        }
-        S.wantAutoPlayOnClick = false;
-        S.clickAutoplayTimer = null;
-      }, 160);
+      // Start playback *immediately* inside the gesture on mobile/Android
+      if (!S.ws.isPlaying()) playSafe(S.ws);
     });
 
-    // Seek: clamp to region, position exactly, schedule forward-only pause, autoplay if requested
+    // Seek: clamp, position, reschedule, optionally autoplay
     ws.on("seek", (p) => {
       const clickedTime = p * S.duration;
       const st = S.region?.start ?? 0;
@@ -341,14 +431,11 @@ export default function initPlayer(userCfg = {}) {
         if (t > en) t = Math.max(st, en - 0.001);
 
         setPlayhead(t);
-        setNextPauseIdxFrom(t, CLICK_GRACE_SEC);
+        setNextPauseIdxFrom(t, true, CLICK_GRACE_SEC);
 
         if (S.wantAutoPlayOnClick) {
-          requestAnimationFrame(() => {
-            const pr = ws.play?.(); if (pr && pr.catch) pr.catch(() => {});
-          });
+          playSafe(ws);
           S.wantAutoPlayOnClick = false;
-          if (S.clickAutoplayTimer) { clearTimeout(S.clickAutoplayTimer); S.clickAutoplayTimer = null; }
         }
 
         clearTimer();
@@ -360,7 +447,7 @@ export default function initPlayer(userCfg = {}) {
 
       // programmatic seeks
       S.parkedAtEnd = (Math.abs(clickedTime - en) < 0.003);
-      setNextPauseIdxFrom(clickedTime);
+      setNextPauseIdxFrom(clickedTime, true);
       clearTimer();
       if (ENABLE_PAUSE_MARKS && ws.isPlaying() && !S.parkedAtEnd) scheduleNextPause();
     });
@@ -373,11 +460,11 @@ export default function initPlayer(userCfg = {}) {
       if (S.parkedAtEnd || t < st || t >= en) {
         pauseThenSnap(st);
         S.parkedAtEnd = false;
-        setNextPauseIdxFrom(st);
-        playNextFrame(ws);
+        setNextPauseIdxFrom(st, true);
+        requestAnimationFrame(() => playSafe(ws));
         scheduleNextPause();
       } else {
-        setNextPauseIdxFrom(t);
+        setNextPauseIdxFrom(t, true);
         if (ENABLE_PAUSE_MARKS) scheduleNextPause();
       }
     });
@@ -385,7 +472,7 @@ export default function initPlayer(userCfg = {}) {
     ws.on("pause", () => { clearTimer(); });
   };
 
-  /* ------------------------------ Controls ------------------------------ */
+  /* ------------------------------ Controls (public API) ------------------------------ */
 
   function playPause() {
     const ws = S.ws; if (!ws) return;
@@ -400,16 +487,16 @@ export default function initPlayer(userCfg = {}) {
       if (S.parkedAtEnd || t < st || t >= en) {
         pauseThenSnap(st);
         S.parkedAtEnd = false;
-        setNextPauseIdxFrom(st);
-        playNextFrame(ws);
+        setNextPauseIdxFrom(st, true);
+        requestAnimationFrame(() => playSafe(ws));
         scheduleNextPause();
         return;
       } else {
-        setNextPauseIdxFrom(t);
+        setNextPauseIdxFrom(t, true);
       }
     }
 
-    playNextFrame(ws);
+    requestAnimationFrame(() => playSafe(ws));
     scheduleNextPause();
   }
 
@@ -417,7 +504,7 @@ export default function initPlayer(userCfg = {}) {
     if (!S.ws) return;
     S.ws.stop();
     S.parkedAtEnd = false;
-    setNextPauseIdxFrom(S.region ? S.region.start : 0);
+    setNextPauseIdxFrom(S.region ? S.region.start : 0, true);
     clearTimer();
   }
 
@@ -448,8 +535,9 @@ export default function initPlayer(userCfg = {}) {
   }
 
   function loadNewAudio(newUrl) {
-    const cleanUrl = String(newUrl).replace("[sound:", "").replace("}", "").trim();
-    createWaveSurfer(cleanUrl);
+    const cleaned = cleanAudioUrl(newUrl);
+    if (!cleaned) { console.error("[player] loadNewAudio got empty URL from:", newUrl); return; }
+    createWaveSurfer(cleaned);
   }
 
   // Expose for buttons (unchanged API)
@@ -462,19 +550,20 @@ export default function initPlayer(userCfg = {}) {
   /* ------------------------------ Sticky sizing ------------------------------ */
 
   const sizeStickyPlayer = rafThrottle(() => {
-    const el = document.getElementById("playerContainer");
+    const el = $("playerContainer");
     if (!el) return;
     document.documentElement.style.setProperty("--player-height", (el.offsetHeight || 0) + "px");
   });
-  window.addEventListener("resize", sizeStickyPlayer, { passive: true });
-  window.addEventListener("orientationchange", sizeStickyPlayer, { passive: true });
+  addEventListener("resize", sizeStickyPlayer, { passive: true });
+  addEventListener("orientationchange", sizeStickyPlayer, { passive: true });
 
   /* ------------------------------ Init ------------------------------ */
 
+  const boot = () => createWaveSurfer(audioUrl);
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", () => createWaveSurfer(audioUrlRaw), { once: true });
+    document.addEventListener("DOMContentLoaded", boot, { once: true });
   } else {
-    createWaveSurfer(audioUrlRaw);
+    boot();
   }
 
   /* ------------------------------ Keyboard ------------------------------ */
@@ -487,12 +576,12 @@ export default function initPlayer(userCfg = {}) {
     const ws = S.ws; if (!ws) return;
 
     switch ((e.key || "").toLowerCase()) {
-      case "g": e.preventDefault(); ws.skip(-3); break;
+      case "g": e.preventDefault(); skipBy(-3); break;
       case "h": e.preventDefault(); jumpPrevAndPlay(); break;
       case "j": e.preventDefault(); playPause(); break;
-      case "k": e.preventDefault(); ws.skip(0.5); break;
+      case "k": e.preventDefault(); skipBy(+0.5); break;
       case "l":
-      case "p": e.preventDefault(); ws.skip(-100); break;
+      case "p": e.preventDefault(); skipBy(-100); break;
     }
   };
 
@@ -501,11 +590,9 @@ export default function initPlayer(userCfg = {}) {
 
   /* ------------------------------ Buttons ------------------------------ */
 
-  if (playPauseBtn) playPauseBtn.addEventListener("click", (e) => { e.preventDefault(); playPause(); }, { passive: true });
-  if (prevMarkBtn)  prevMarkBtn.addEventListener("click",  (e) => { e.preventDefault(); jumpPrevAndPlay(); }, { passive: true });
-  if (stopBtn)      stopBtn.addEventListener("click",      (e) => { e.preventDefault(); stopPlayback(); }, { passive: true });
-  if (skipBackwardBtn) skipBackwardBtn.addEventListener("click", (e) => {
-    e.preventDefault(); const ws = S.ws; if (ws) ws.skip(-3);
-  }, { passive: true });
-  if (resetRegionBtn) resetRegionBtn.addEventListener("click", (e) => { e.preventDefault(); resetRegion(); }, { passive: true });
+  playPauseBtn    && playPauseBtn.addEventListener("click", () => { playPause(); });
+  prevMarkBtn     && prevMarkBtn.addEventListener("click",  () => { jumpPrevAndPlay(); });
+  stopBtn         && stopBtn.addEventListener("click",      () => { stopPlayback(); });
+  skipBackwardBtn && skipBackwardBtn.addEventListener("click", () => { skipBy(-3); });
+  resetRegionBtn  && resetRegionBtn.addEventListener("click",  () => { resetRegion(); });
 }
