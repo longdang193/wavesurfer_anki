@@ -1,123 +1,127 @@
-:root { --player-height: 168px; }
+:root{
+  --player-height:168px;
+  --gap:10px;
+  --btn-r:10px;
 
-/* ===== Desktop / base ===== */
-#playPauseButton {
-  background: #4CAF50; color: #fff; border: 0; padding: 8px 12px;
-  font-size: 14px; border-radius: 6px; cursor: pointer; margin-top: 16px;
-}
-#prevMarkButton {
-  background: navy; color: #fff; border: 0; padding: 8px 12px;
-  font-size: 14px; border-radius: 6px; cursor: pointer; margin-top: 16px;
-}
-#stopButton {
-  background: #F44336; color: #fff; border: 0; padding: 8px 12px;
-  font-size: 14px; border-radius: 6px; cursor: pointer; margin-left: 8px; margin-top: 16px;
-}
-#resetRegionButton {
-  background: orange; color: #111; border: 0; padding: 8px 12px;
-  font-size: 14px; border-radius: 6px; cursor: pointer; margin-left: 8px; margin-top: 16px;
-}
-#skipBackwardButton {
-  background: #888; color: #fff; border: 0; padding: 8px 12px;
-  font-size: 14px; border-radius: 6px; cursor: pointer; margin-top: 16px;
-}
-#stopButton:hover { background: #D32F2F; }
+  /* base sizes (desktop/default) */
+  --btn-h:44px;
+  --btn-pad:10px 12px;
+  --big-btn-pad:16px;
+  --big-btn-fs:18px;
+  --small-btn-fs:14px;
 
-#timestamp { font-size: 12px; margin-top: 6px; }
-#playerContainer { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
-#controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-#waveform { width: 100%; }
+  /* mobile overrides (used below) */
+  --m-big-btn-h:58px;
+  --m-big-btn-pad:20px;
+  --m-big-btn-fs:22px;
 
-/* New mobile-only speed row hidden by default (desktop) */
-#speedRow { display: none; }
+  --m-util-btn-h:36px;
+  --m-util-btn-pad:8px 10px;
+  --m-util-btn-fs:13px;
+}
 
-/* Spacer hidden by default (desktop) */
-#playerSafetySpacer { display: none; }
+/* ===== Desktop / base (unchanged look) ===== */
+#playerContainer{
+  display:flex; flex-direction:column; align-items:flex-start; gap:6px;
+  content-visibility:auto; contain:layout paint style;
+}
+
+#waveform{ width:100%; }
+
+#controls{ display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+
+#timestamp{ font-size:12px; margin-top:6px; }
+
+:where(#playPauseButton,#prevMarkButton,#stopButton,#resetRegionButton,#skipBackwardButton){
+  border:0; padding:8px 12px; font-size:14px; border-radius:6px; cursor:pointer;
+  margin-top:16px;
+}
+
+#playPauseButton{ background:#4CAF50; color:#fff; }
+#prevMarkButton{ background:navy; color:#fff; }
+#skipBackwardButton{ background:#888; color:#fff; }
+#stopButton{ background:#F44336; color:#fff; margin-left:8px; }
+#resetRegionButton{ background:orange; color:#111; margin-left:8px; }
+
+@media (hover:hover){ #stopButton:hover{ background:#D32F2F; } }
+
+/* desktop-only visibility of mobile bits */
+#speedRow, #playerSafetySpacer{ display:none; }
 
 /* ===== Mobile layout ===== */
-@media (max-width: 768px) {
-  #playerContainer {
-    position: fixed; left: 0; right: 0; bottom: 0;
-    background: rgba(33,33,33,0.9);
-    border-top: 1px solid rgba(255,255,255,0.12);
-    padding: 10px
-             max(10px, env(safe-area-inset-right))
-             calc(10px + env(safe-area-inset-bottom))
-             max(10px, env(safe-area-inset-left));
-    z-index: 9999;
-    align-items: stretch;
-    gap: 10px;
-  }
-
-  /* Order: speed row -> waveform -> timestamp -> controls grid */
-  #speedRow   { display: flex; order: 0; gap: 6px; justify-content: space-between; }
-  #waveform   { order: 1; width: 100%; height: 64px !important; margin: 0; }
-  #timestamp  { order: 2; width: 100%; text-align: center; margin: 0; font-size: 12px; }
-
-  /* Relative grid: 6 equal columns */
-  #controls {
-    order: 3;
-    width: 100%;
-    display: grid;
-    gap: 8px;
-    grid-template-columns: repeat(6, 1fr);
+@media (max-width:768px){
+  #playerContainer{
+    position:fixed; left:0; right:0; bottom:0;
+    background:rgba(33,33,33,0.9);
+    border-top:1px solid rgba(255,255,255,0.12);
+    padding:10px max(10px, env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left));
+    z-index:9999; gap:var(--gap);
+    display:grid;
+    grid-template-columns:repeat(6,1fr);
     grid-template-areas:
-      "play play play prev prev prev"
-      "back back stop stop reset reset";
-    grid-auto-rows: minmax(44px, auto);
+      "speed speed speed speed speed speed"
+      "util  util  util  util  util  util"
+      "wave  wave  wave  wave  wave  wave"
+      "time  time  time  time  time  time"
+      "play  play  play  prev  prev  prev";
+    grid-auto-rows:auto;
+    align-items:stretch;
+    content-visibility:auto; contain:layout paint style;
   }
 
-  /* Primary buttons equal size via grid areas */
-  #playPauseButton {
-    grid-area: play; padding: 16px; font-size: 18px; border-radius: 10px; margin: 0;
-    background: #4CAF50; color: #fff;
-  }
-  #prevMarkButton {
-    grid-area: prev; padding: 16px; font-size: 18px; border-radius: 10px; margin: 0;
-    background: transparent; color: #3B82F6; border: 2px solid #3B82F6;
+  #controls{ display:contents; }
+
+  /* speed row (top) */
+  #speedRow{ display:flex; grid-area:speed; gap:6px; justify-content:space-between; }
+  #speedRow .btn-speed{
+    flex:1 1 auto; min-width:34px; padding:4px 6px; font-size:12px;
+    background:rgba(59,130,246,0.18); color:#e5e7eb;
+    border:1px solid rgba(59,130,246,0.45); border-radius:8px;
   }
 
-  /* Utility row — smaller, all relative */
-  #skipBackwardButton {
-    grid-area: back; padding: 10px 12px; font-size: 14px; border-radius: 10px; margin: 0;
-    background: #3b3b3b; color: #fff;
+  /* waveform + timestamp */
+  #waveform{ grid-area:wave; width:100%; height:64px !important; margin:0; }
+  #timestamp{ grid-area:time; width:100%; text-align:center; margin:0; font-size:12px; }
+
+  /* BIG primary buttons (bottom row) — bigger */
+  #playPauseButton{
+    grid-area:play; margin:0;
+    padding:var(--m-big-btn-pad, var(--big-btn-pad));
+    min-height:var(--m-big-btn-h);
+    font-size:var(--m-big-btn-fs, var(--big-btn-fs));
+    border-radius:var(--btn-r);
+    background:#4CAF50; color:#fff;
   }
-  #stopButton {
-    grid-area: stop; padding: 10px 12px; font-size: 14px; border-radius: 10px; margin: 0;
-    background: #F44336; color: #fff;
-  }
-  #resetRegionButton {
-    grid-area: reset; padding: 10px 12px; font-size: 14px; border-radius: 10px; margin: 0;
-    background: #f59e0b; color: #111;
+  #prevMarkButton{
+    grid-area:prev; margin:0;
+    padding:var(--m-big-btn-pad, var(--big-btn-pad));
+    min-height:var(--m-big-btn-h);
+    font-size:var(--m-big-btn-fs, var(--big-btn-fs));
+    border-radius:var(--btn-r);
+    background:transparent; color:#3B82F6; border:2px solid #3B82F6;
   }
 
-  /* Mobile speed chips (above waveform), small & translucent */
-  #speedRow .btn-speed {
-    flex: 1 1 auto;
-    min-width: 34px;
-    padding: 4px 6px;
-    font-size: 12px;
-    background: rgba(59,130,246,0.18);
-    color: #e5e7eb;
-    border: 1px solid rgba(59,130,246,0.45);
-    border-radius: 8px;
-  }
-
-  /* Hide desktop speed buttons inside #controls on mobile */
-  #controls .btn-speed { display: none !important; }
-
-  /* Normalize margins for touch targets */
-  #controls button,
-  #playPauseButton,
-  #prevMarkButton,
+  /* Utility row ABOVE wave — smaller */
+  #skipBackwardButton,
   #stopButton,
-  #resetRegionButton,
-  #skipBackwardButton { margin: 0; }
+  #resetRegionButton{
+    grid-area:util; margin:0;
+    padding:var(--m-util-btn-pad);
+    min-height:var(--m-util-btn-h);
+    font-size:var(--m-util-btn-fs);
+    border-radius:var(--btn-r);
+  }
+  #skipBackwardButton{ background:#3b3b3b; color:#fff; grid-column:1 / span 2; }
+  #stopButton{ background:#F44336; color:#fff; grid-column:3 / span 2; }
+  #resetRegionButton{ background:#f59e0b; color:#111; grid-column:5 / span 2; }
 
-  /* Spacer so page content stays above the sticky player */
-  #playerSafetySpacer {
-    display: block;
-    height: calc(var(--player-height) + env(safe-area-inset-bottom));
-    width: 100%;
+  #controls .btn-speed{ display:none !important; }
+
+  :where(#playPauseButton,#prevMarkButton,#stopButton,#resetRegionButton,#skipBackwardButton){ margin:0; }
+
+  #playerSafetySpacer{
+    display:block;
+    height:calc(var(--player-height) + env(safe-area-inset-bottom));
+    width:100%;
   }
 }
